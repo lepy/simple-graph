@@ -12,16 +12,7 @@ using an atomic transaction wrapper function.
 import sqlite3
 import json
 from itertools import tee
-import os
-import uuid
-modulepath = os.path.dirname(__file__)
-
-def uuidstr2uuidint(uuidhex):
-    uid = uuid.UUID(uuidhex)
-    return uid.int
-
-def uuidint2uuidhex(uuidint):
-    return uuid.UUID(int=uuidint).hex
+from graphviz import Digraph
 
 def atomic(db_file, cursor_exec_fn):
     connection = sqlite3.connect(db_file)
@@ -32,10 +23,7 @@ def atomic(db_file, cursor_exec_fn):
     connection.close()
     return results
 
-def initialize(db_file, schema_file=None):
-    if schema_file is None:
-        schema_file = os.path.join(modulepath, 'schema.sql')
-
+def initialize(db_file, schema_file='schema.sql'):
     def _init(cursor):
         with open(schema_file) as f:
             for statement in f.read().split(';'):
@@ -79,18 +67,11 @@ def remove_node(identifier):
     return _remove_node
 
 def _parse_search_results(results, idx=0):
-    presults = []
-    for item in results:
-        try:
-            presults.append(json.loads(item[idx]))
-        except:
-            presults.append(item[idx])
-    return presults
+    return [json.loads(item[idx]) for item in results]
 
 def find_node(identifier):
     def _find_node(cursor):
         results = cursor.execute("SELECT body FROM nodes WHERE json_extract(body, '$.id') = ?", (identifier,)).fetchall()
-        # results = cursor.execute("SELECT body FROM nodes WHERE json_extract(body, '$.id') = {}".format(identifier)).fetchall()
         if len(results) == 1:
             return _parse_search_results(results).pop()
         return {}
@@ -165,11 +146,6 @@ def get_connections(source_id, target_id):
         return cursor.execute("SELECT * FROM edges WHERE source = ? AND target = ?", (source_id, target_id,)).fetchall()
     return _get_connections
 
-def get_source_connections(source_id):
-    def _get_connections(cursor):
-        return cursor.execute("SELECT * FROM edges WHERE source = ? ", (source_id, )).fetchall()
-    return _get_connections
-
 def pairwise(iterable):
     a, b = tee(iterable)
     next(b, None)
@@ -181,56 +157,26 @@ def _fstring_from_keys(keys, hide_key, kv_separator):
     return '\\n'.join([k+kv_separator+'{'+k+'}' for k in keys])
 
 def _as_dot_label(body, exclude_keys, hide_key_name, kv_separator):
-    # sanitize keys (remove "!")
-    sbody = {}
-    for k, v in body.items():
-        sbody[k.replace("!", "")] = v
-
-    values = _fstring_from_keys([k for k in sbody.keys() if k not in exclude_keys], hide_key_name, kv_separator).format(**sbody)
-    return f"[label=\"{values}\"]"
+    return _fstring_from_keys([k for k in body.keys() if k not in exclude_keys], hide_key_name, kv_separator).format(**body)
 
 def _as_dot_node(body, exclude_keys=[], hide_key_name=False, kv_separator=' '):
     name = body['id']
     exclude_keys.append('id')
     label = _as_dot_label(body, exclude_keys, hide_key_name, kv_separator)
-    return f'"{name}" {label};\n'
+    return str(name), label
 
-def _as_dot_edge(src, tgt, body, exclude_keys=[], hide_key_name=False, kv_separator=' '):
-    label = _as_dot_label(body, exclude_keys, hide_key_name, kv_separator)
-    return f'"{src}" -> "{tgt}" {label};\n'
-
-def visualize(db_file, dot_file=None, path=[], \
-        exclude_node_keys=[], hide_node_key=False, node_kv=' ', \
-        exclude_edge_keys=[], hide_edge_key=False, edge_kv=' '):
-    if dot_file is None:
-        dot_file = "simple_graph.dot"
-    def _visualize(cursor):
-        with open(dot_file, 'w') as w:
-            w.write("digraph {\n")
-            for node in [atomic(db_file, find_node(i)) for i in path]:
-                w.write(_as_dot_node(node, exclude_node_keys, hide_node_key, node_kv))
-            for src, tgt in pairwise(path):
-                for inbound in _get_edge_properties(atomic(db_file, get_connections(src, tgt))):
-                    w.write(_as_dot_edge(src, tgt, inbound, exclude_edge_keys, hide_edge_key, edge_kv))
-                for outbound in _get_edge_properties(atomic(db_file, get_connections(tgt, src))):
-                    w.write(_as_dot_edge(tgt, src, outbound, exclude_edge_keys, hide_edge_key, edge_kv))
-            w.write("}\n")
-    return atomic(db_file, _visualize)
-
-def get_dot(db_file, dot_file=None, path=[], \
+def visualize(db_file, dot_file, path=[], format='png', \
         exclude_node_keys=[], hide_node_key=False, node_kv=' ', \
         exclude_edge_keys=[], hide_edge_key=False, edge_kv=' '):
     def _visualize(cursor):
-        dots = []
-        dots.append("digraph {\n")
+        dot = Digraph()
         for node in [atomic(db_file, find_node(i)) for i in path]:
-            dots.append(_as_dot_node(node, exclude_node_keys, hide_node_key, node_kv))
-            src = node["uuid"]
-            for src, tgt, inbound in atomic(db_file, get_source_connections(src)):
-                dots.append(_as_dot_edge(src, tgt, {}, exclude_edge_keys, hide_edge_key, edge_kv))
-        dots.append("}\n")
-        if dot_file is not None:
-            with open(dot_file, 'w') as fh:
-                fh.writelines(dots)
-        return "".join(dots)
+            name, label = _as_dot_node(node, exclude_node_keys, hide_node_key, node_kv)
+            dot.node(name, label=label)
+        for src, tgt in pairwise(path):
+            for inbound in _get_edge_properties(atomic(db_file, get_connections(src, tgt))):
+                dot.edge(str(src), str(tgt), label=_as_dot_label(inbound, exclude_edge_keys, hide_edge_key, edge_kv))
+            for outbound in _get_edge_properties(atomic(db_file, get_connections(tgt, src))):
+                dot.edge(str(tgt), str(src), label=_as_dot_label(outbound, exclude_edge_keys, hide_edge_key, edge_kv))
+        dot.render(dot_file, format=format)
     return atomic(db_file, _visualize)
